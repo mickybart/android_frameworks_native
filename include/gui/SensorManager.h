@@ -79,6 +79,34 @@ private:
     const String16 mOpPackageName;
 };
 
+#ifdef LEGACY_BLOB_COMPATIBLE
+class sensormanager :
+    public ASensorManager,
+    public Singleton<sensormanager>
+{
+public:
+    sensormanager();
+    ~sensormanager();
+
+    ssize_t getSensorList(Sensor const* const** list) const;
+    Sensor const* getDefaultSensor(int type);
+    sp<SensorEventQueue> createEventQueue();
+
+private:
+    // DeathRecipient interface
+    void sensorManagerDied();
+
+    status_t assertStateLocked() const;
+
+private:
+    mutable Mutex mLock;
+    mutable sp<ISensorServer> mSensorServer;
+    mutable Sensor const** mSensorList;
+    mutable Vector<Sensor> mSensors;
+    mutable sp<IBinder::DeathRecipient> mDeathObserver;
+};
+#endif // LEGACY_BLOB_COMPATIBLE
+
 // ----------------------------------------------------------------------------
 }; // namespace android
 
