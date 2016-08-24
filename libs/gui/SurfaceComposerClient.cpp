@@ -818,6 +818,22 @@ status_t SurfaceComposerClient::getHdrCapabilities(const sp<IBinder>& display,
             outCapabilities);
 }
 
+#ifdef LEGACY_BLOB_COMPATIBLE
+ssize_t SurfaceComposerClient::getDisplayWidth(int32_t displayId) {
+    DisplayInfo info;
+    if (getDisplayInfo(getBuiltInDisplay(displayId), &info) != NO_ERROR)
+        return 0;
+    return static_cast<ssize_t>(info.w);
+}
+
+ssize_t SurfaceComposerClient::getDisplayHeight(int32_t displayId) {
+    DisplayInfo info;
+    if (getDisplayInfo(getBuiltInDisplay(displayId), &info) != NO_ERROR)
+        return 0;
+    return static_cast<ssize_t>(info.h);
+}
+#endif
+
 // ----------------------------------------------------------------------------
 
 status_t ScreenshotClient::capture(

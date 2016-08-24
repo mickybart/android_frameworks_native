@@ -2621,4 +2621,1487 @@ void Parcel::Blob::clear() {
     mMutable = false;
 }
 
+#ifdef LEGACY_BLOB_COMPATIBLE
+
+// ---------------------------------------------------------------------------
+
+parcel::parcel()
+{
+    LOG_ALLOC("Parcel %p: constructing", this);
+    initState();
+}
+
+parcel::~parcel()
+{
+    freeDataNoInit();
+    LOG_ALLOC("Parcel %p: destroyed", this);
+}
+
+size_t parcel::getGlobalAllocSize() {
+    pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+    size_t size = gParcelGlobalAllocSize;
+    pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+    return size;
+}
+
+size_t parcel::getGlobalAllocCount() {
+    pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+    size_t count = gParcelGlobalAllocCount;
+    pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+    return count;
+}
+
+const uint8_t* parcel::data() const
+{
+    return mData;
+}
+
+size_t parcel::dataSize() const
+{
+    return (mDataSize > mDataPos ? mDataSize : mDataPos);
+}
+
+size_t parcel::dataAvail() const
+{
+    // TODO: decide what to do about the possibility that this can
+    // report an available-data size that exceeds a Java int's max
+    // positive value, causing havoc.  Fortunately this will only
+    // happen if someone constructs a Parcel containing more than two
+    // gigabytes of data, which on typical phone hardware is simply
+    // not possible.
+    return dataSize() - dataPosition();
+}
+
+size_t parcel::dataPosition() const
+{
+    return mDataPos;
+}
+
+size_t parcel::dataCapacity() const
+{
+    return mDataCapacity;
+}
+
+status_t parcel::setDataSize(size_t size)
+{
+    status_t err;
+    err = continueWrite(size);
+    if (err == NO_ERROR) {
+        mDataSize = size;
+        ALOGV("setDataSize Setting data size of %p to %zu", this, mDataSize);
+    }
+    return err;
+}
+
+void parcel::setDataPosition(size_t pos) const
+{
+    mDataPos = pos;
+    mNextObjectHint = 0;
+}
+
+status_t parcel::setDataCapacity(size_t size)
+{
+    if (size > mDataCapacity) return continueWrite(size);
+    return NO_ERROR;
+}
+
+status_t parcel::setData(const uint8_t* buffer, size_t len)
+{
+    status_t err = restartWrite(len);
+    if (err == NO_ERROR) {
+        memcpy(const_cast<uint8_t*>(data()), buffer, len);
+        mDataSize = len;
+        mFdsKnown = false;
+    }
+    return err;
+}
+
+status_t parcel::appendFrom(const parcel *pc, size_t offset, size_t len)
+{
+    const sp<ProcessState> proc(ProcessState::self());
+    status_t err;
+    const uint8_t *data = pc->mData;
+    const binder_size_t *objects = pc->mObjects;
+    size_t size = pc->mObjectsSize;
+    int startPos = mDataPos;
+    int firstIndex = -1, lastIndex = -2;
+
+    if (len == 0) {
+        return NO_ERROR;
+    }
+
+    // range checks against the source parcel size
+    if ((offset > pc->mDataSize)
+            || (len > pc->mDataSize)
+            || (offset + len > pc->mDataSize)) {
+        return BAD_VALUE;
+    }
+
+    // Count objects in range
+    for (int i = 0; i < (int) size; i++) {
+        size_t off = objects[i];
+        if ((off >= offset) && (off + sizeof(flat_binder_object) <= offset + len)) {
+            if (firstIndex == -1) {
+                firstIndex = i;
+            }
+            lastIndex = i;
+        }
+    }
+    int numObjects = lastIndex - firstIndex + 1;
+
+    if ((mDataSize+len) > mDataCapacity) {
+        // grow data
+        err = growData(len);
+        if (err != NO_ERROR) {
+            return err;
+        }
+    }
+
+    // append data
+    memcpy(mData + mDataPos, data + offset, len);
+    mDataPos += len;
+    mDataSize += len;
+
+    err = NO_ERROR;
+
+    if (numObjects > 0) {
+        // grow objects
+        if (mObjectsCapacity < mObjectsSize + numObjects) {
+            int newSize = ((mObjectsSize + numObjects)*3)/2;
+            binder_size_t *objects =
+                (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
+            if (objects == (binder_size_t*)0) {
+                return NO_MEMORY;
+            }
+            mObjects = objects;
+            mObjectsCapacity = newSize;
+        }
+
+        // append and acquire objects
+        int idx = mObjectsSize;
+        for (int i = firstIndex; i <= lastIndex; i++) {
+            size_t off = objects[i] - offset + startPos;
+            mObjects[idx++] = off;
+            mObjectsSize++;
+
+            flat_binder_object* flat
+                = reinterpret_cast<flat_binder_object*>(mData + off);
+            acquire_object(proc, *flat, this);
+
+            if (flat->type == BINDER_TYPE_FD) {
+                // If this is a file descriptor, we need to dup it so the
+                // new Parcel now owns its own fd, and can declare that we
+                // officially know we have fds.
+                flat->handle = dup(flat->handle);
+                flat->cookie = 1;
+                mHasFds = mFdsKnown = true;
+                if (!mAllowFds) {
+                    err = FDS_NOT_ALLOWED;
+                }
+            }
+        }
+    }
+
+    return err;
+}
+
+bool parcel::pushAllowFds(bool allowFds)
+{
+    const bool origValue = mAllowFds;
+    if (!allowFds) {
+        mAllowFds = false;
+    }
+    return origValue;
+}
+
+void parcel::restoreAllowFds(bool lastValue)
+{
+    mAllowFds = lastValue;
+}
+
+bool parcel::hasFileDescriptors() const
+{
+    if (!mFdsKnown) {
+        scanForFds();
+    }
+    return mHasFds;
+}
+
+// Write RPC headers.  (previously just the interface token)
+status_t parcel::writeInterfaceToken(const String16& interface)
+{
+    writeInt32(IPCThreadState::self()->getStrictModePolicy() |
+               STRICT_MODE_PENALTY_GATHER);
+    // currently the interface identification token is just its name as a string
+    return writeString16(interface);
+}
+
+bool parcel::checkInterface(IBinder* binder) const
+{
+    return enforceInterface(binder->getInterfaceDescriptor());
+}
+
+bool parcel::enforceInterface(const String16& interface,
+                              IPCThreadState* threadState) const
+{
+    int32_t strictPolicy = readInt32();
+    if (threadState == NULL) {
+        threadState = IPCThreadState::self();
+    }
+    if ((threadState->getLastTransactionBinderFlags() &
+         IBinder::FLAG_ONEWAY) != 0) {
+      // For one-way calls, the callee is running entirely
+      // disconnected from the caller, so disable StrictMode entirely.
+      // Not only does disk/network usage not impact the caller, but
+      // there's no way to commuicate back any violations anyway.
+      threadState->setStrictModePolicy(0);
+    } else {
+      threadState->setStrictModePolicy(strictPolicy);
+    }
+    const String16 str(readString16());
+    if (str == interface) {
+        return true;
+    } else {
+        ALOGW("**** enforceInterface() expected '%s' but read '%s'",
+                String8(interface).string(), String8(str).string());
+        return false;
+    }
+}
+
+const binder_size_t* parcel::objects() const
+{
+    return mObjects;
+}
+
+size_t parcel::objectsCount() const
+{
+    return mObjectsSize;
+}
+
+status_t parcel::errorCheck() const
+{
+    return mError;
+}
+
+void parcel::setError(status_t err)
+{
+    mError = err;
+}
+
+status_t parcel::finishWrite(size_t len)
+{
+    //printf("Finish write of %d\n", len);
+    mDataPos += len;
+    ALOGV("finishWrite Setting data pos of %p to %zu", this, mDataPos);
+    if (mDataPos > mDataSize) {
+        mDataSize = mDataPos;
+        ALOGV("finishWrite Setting data size of %p to %zu", this, mDataSize);
+    }
+    //printf("New pos=%d, size=%d\n", mDataPos, mDataSize);
+    return NO_ERROR;
+}
+
+status_t parcel::writeUnpadded(const void* data, size_t len)
+{
+    size_t end = mDataPos + len;
+    if (end < mDataPos) {
+        // integer overflow
+        return BAD_VALUE;
+    }
+
+    if (end <= mDataCapacity) {
+restart_write:
+        memcpy(mData+mDataPos, data, len);
+        return finishWrite(len);
+    }
+
+    status_t err = growData(len);
+    if (err == NO_ERROR) goto restart_write;
+    return err;
+}
+
+status_t parcel::write(const void* data, size_t len)
+{
+    void* const d = writeInplace(len);
+    if (d) {
+        memcpy(d, data, len);
+        return NO_ERROR;
+    }
+    return mError;
+}
+
+void* parcel::writeInplace(size_t len)
+{
+    const size_t padded = pad_size(len);
+
+    // sanity check for integer overflow
+    if (mDataPos+padded < mDataPos) {
+        return NULL;
+    }
+
+    if ((mDataPos+padded) <= mDataCapacity) {
+restart_write:
+        //printf("Writing %ld bytes, padded to %ld\n", len, padded);
+        uint8_t* const data = mData+mDataPos;
+
+        // Need to pad at end?
+        if (padded != len) {
+#if BYTE_ORDER == BIG_ENDIAN
+            static const uint32_t mask[4] = {
+                0x00000000, 0xffffff00, 0xffff0000, 0xff000000
+            };
+#endif
+#if BYTE_ORDER == LITTLE_ENDIAN
+            static const uint32_t mask[4] = {
+                0x00000000, 0x00ffffff, 0x0000ffff, 0x000000ff
+            };
+#endif
+            //printf("Applying pad mask: %p to %p\n", (void*)mask[padded-len],
+            //    *reinterpret_cast<void**>(data+padded-4));
+            *reinterpret_cast<uint32_t*>(data+padded-4) &= mask[padded-len];
+        }
+
+        finishWrite(padded);
+        return data;
+    }
+
+    status_t err = growData(padded);
+    if (err == NO_ERROR) goto restart_write;
+    return NULL;
+}
+
+status_t parcel::writeInt32(int32_t val)
+{
+    return writeAligned(val);
+}
+status_t parcel::writeInt32Array(size_t len, const int32_t *val) {
+    if (!val) {
+        return writeAligned(-1);
+    }
+    status_t ret = writeAligned(len);
+    if (ret == NO_ERROR) {
+        ret = write(val, len * sizeof(*val));
+    }
+    return ret;
+}
+status_t parcel::writeByteArray(size_t len, const uint8_t *val) {
+    if (!val) {
+        return writeAligned(-1);
+    }
+    status_t ret = writeAligned(len);
+    if (ret == NO_ERROR) {
+        ret = write(val, len * sizeof(*val));
+    }
+    return ret;
+}
+
+status_t parcel::writeInt64(int64_t val)
+{
+    return writeAligned(val);
+}
+
+status_t parcel::writePointer(uintptr_t val)
+{
+    return writeAligned<binder_uintptr_t>(val);
+}
+
+status_t parcel::writeFloat(float val)
+{
+    return writeAligned(val);
+}
+
+#if defined(__mips__) && defined(__mips_hard_float)
+
+status_t parcel::writeDouble(double val)
+{
+    union {
+        double d;
+        unsigned long long ll;
+    } u;
+    u.d = val;
+    return writeAligned(u.ll);
+}
+
+#else
+
+status_t parcel::writeDouble(double val)
+{
+    return writeAligned(val);
+}
+
+#endif
+
+status_t parcel::writeCString(const char* str)
+{
+    return write(str, strlen(str)+1);
+}
+
+status_t parcel::writeString8(const String8& str)
+{
+    status_t err = writeInt32(str.bytes());
+    // only write string if its length is more than zero characters,
+    // as readString8 will only read if the length field is non-zero.
+    // this is slightly different from how writeString16 works.
+    if (str.bytes() > 0 && err == NO_ERROR) {
+        err = write(str.string(), str.bytes()+1);
+    }
+    return err;
+}
+
+status_t parcel::writeString16(const String16& str)
+{
+    return writeString16((const uint16_t*)(str.string()), str.size());
+}
+
+status_t parcel::writeString16(const uint16_t* str, size_t len)
+{
+    if (str == NULL) return writeInt32(-1);
+
+    status_t err = writeInt32(len);
+    if (err == NO_ERROR) {
+        len *= sizeof(uint16_t);
+        uint8_t* data = (uint8_t*)writeInplace(len+sizeof(uint16_t));
+        if (data) {
+            memcpy(data, str, len);
+            *reinterpret_cast<uint16_t*>(data+len) = 0;
+            return NO_ERROR;
+        }
+        err = mError;
+    }
+    return err;
+}
+
+status_t parcel::writeNativeHandle(const native_handle* handle)
+{
+    if (!handle || handle->version != sizeof(native_handle))
+        return BAD_TYPE;
+
+    status_t err;
+    err = writeInt32(handle->numFds);
+    if (err != NO_ERROR) return err;
+
+    err = writeInt32(handle->numInts);
+    if (err != NO_ERROR) return err;
+
+    for (int i=0 ; err==NO_ERROR && i<handle->numFds ; i++)
+        err = writeDupFileDescriptor(handle->data[i]);
+
+    if (err != NO_ERROR) {
+        ALOGD("write native handle, write dup fd failed");
+        return err;
+    }
+    err = write(handle->data + handle->numFds, sizeof(int)*handle->numInts);
+    return err;
+}
+
+status_t parcel::writeFileDescriptor(int fd, bool takeOwnership)
+{
+    flat_binder_object obj;
+    obj.type = BINDER_TYPE_FD;
+    obj.flags = 0x7f | FLAT_BINDER_FLAG_ACCEPTS_FDS;
+    obj.binder = 0; /* Don't pass uninitialized stack data to a remote process */
+    obj.handle = fd;
+    obj.cookie = takeOwnership ? 1 : 0;
+    return writeObject(obj, true);
+}
+
+status_t parcel::writeDupFileDescriptor(int fd)
+{
+    int dupFd = dup(fd);
+    if (dupFd < 0) {
+        return -errno;
+    }
+    status_t err = writeFileDescriptor(dupFd, true /*takeOwnership*/);
+    if (err) {
+        close(dupFd);
+    }
+    return err;
+}
+
+// WARNING: This method must stay in sync with
+// Parcelable.Creator<ParcelFileDescriptor> CREATOR
+// in frameworks/base/core/java/android/os/ParcelFileDescriptor.java
+status_t parcel::writeParcelFileDescriptor(int fd, int commChannel) {
+    status_t status;
+
+    if (fd < 0) {
+        status = writeInt32(0); // ParcelFileDescriptor is null
+        if (status) return status;
+    } else {
+        status = writeInt32(1); // ParcelFileDescriptor is not null
+        if (status) return status;
+        status = writeDupFileDescriptor(fd);
+        if (status) return status;
+        if (commChannel < 0) {
+            status = writeInt32(0); // commChannel is null
+            if (status) return status;
+        } else {
+            status = writeInt32(1); // commChannel is not null
+            if (status) return status;
+            status = writeDupFileDescriptor(commChannel);
+        }
+    }
+    return status;
+}
+
+status_t parcel::writeBlob(size_t len, WritableBlob* outBlob)
+{
+    status_t status;
+
+    if (!mAllowFds || len <= BLOB_INPLACE_LIMIT) {
+        ALOGV("writeBlob: write in place");
+        status = writeInt32(0);
+        if (status) return status;
+
+        void* ptr = writeInplace(len);
+        if (!ptr) return NO_MEMORY;
+
+        outBlob->init(false /*mapped*/, ptr, len);
+        return NO_ERROR;
+    }
+
+    ALOGV("writeBlob: write to ashmem");
+    int fd = ashmem_create_region("Parcel Blob", len);
+    if (fd < 0) return NO_MEMORY;
+
+    int result = ashmem_set_prot_region(fd, PROT_READ | PROT_WRITE);
+    if (result < 0) {
+        status = result;
+    } else {
+        void* ptr = ::mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            status = -errno;
+        } else {
+            result = ashmem_set_prot_region(fd, PROT_READ);
+            if (result < 0) {
+                status = result;
+            } else {
+                status = writeInt32(1);
+                if (!status) {
+                    status = writeFileDescriptor(fd, true /*takeOwnership*/);
+                    if (!status) {
+                        outBlob->init(true /*mapped*/, ptr, len);
+                        return NO_ERROR;
+                    }
+                }
+            }
+        }
+        ::munmap(ptr, len);
+    }
+    ::close(fd);
+    return status;
+}
+
+status_t parcel::write(const FlattenableHelperInterface& val)
+{
+    status_t err;
+
+    // size if needed
+    const size_t len = val.getFlattenedSize();
+    const size_t fd_count = val.getFdCount();
+
+    err = this->writeInt32(len);
+    if (err) return err;
+
+    err = this->writeInt32(fd_count);
+    if (err) return err;
+
+    // payload
+    void* const buf = this->writeInplace(pad_size(len));
+    if (buf == NULL)
+        return BAD_VALUE;
+
+    int* fds = NULL;
+    if (fd_count) {
+        fds = new int[fd_count];
+    }
+
+    err = val.flatten(buf, len, fds, fd_count);
+    for (size_t i=0 ; i<fd_count && err==NO_ERROR ; i++) {
+        err = this->writeDupFileDescriptor( fds[i] );
+    }
+
+    if (fd_count) {
+        delete [] fds;
+    }
+
+    return err;
+}
+
+status_t parcel::writeObject(const flat_binder_object& val, bool nullMetaData)
+{
+    const bool enoughData = (mDataPos+sizeof(val)) <= mDataCapacity;
+    const bool enoughObjects = mObjectsSize < mObjectsCapacity;
+    if (enoughData && enoughObjects) {
+restart_write:
+        *reinterpret_cast<flat_binder_object*>(mData+mDataPos) = val;
+
+        // Need to write meta-data?
+        if (nullMetaData || val.binder != 0) {
+            mObjects[mObjectsSize] = mDataPos;
+            acquire_object(ProcessState::self(), val, this);
+            mObjectsSize++;
+        }
+
+        // remember if it's a file descriptor
+        if (val.type == BINDER_TYPE_FD) {
+            if (!mAllowFds) {
+                return FDS_NOT_ALLOWED;
+            }
+            mHasFds = mFdsKnown = true;
+        }
+
+        return finishWrite(sizeof(flat_binder_object));
+    }
+
+    if (!enoughData) {
+        const status_t err = growData(sizeof(val));
+        if (err != NO_ERROR) return err;
+    }
+    if (!enoughObjects) {
+        size_t newSize = ((mObjectsSize+2)*3)/2;
+        binder_size_t* objects = (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
+        if (objects == NULL) return NO_MEMORY;
+        mObjects = objects;
+        mObjectsCapacity = newSize;
+    }
+
+    goto restart_write;
+}
+
+status_t parcel::writeNoException()
+{
+    return writeInt32(0);
+}
+
+void parcel::remove(size_t /*start*/, size_t /*amt*/)
+{
+    LOG_ALWAYS_FATAL("Parcel::remove() not yet implemented!");
+}
+
+status_t parcel::read(void* outData, size_t len) const
+{
+    if ((mDataPos+pad_size(len)) >= mDataPos && (mDataPos+pad_size(len)) <= mDataSize
+            && len <= pad_size(len)) {
+        memcpy(outData, mData+mDataPos, len);
+        mDataPos += pad_size(len);
+        ALOGV("read Setting data pos of %p to %zu", this, mDataPos);
+        return NO_ERROR;
+    }
+    return NOT_ENOUGH_DATA;
+}
+
+const void* parcel::readInplace(size_t len) const
+{
+    if ((mDataPos+pad_size(len)) >= mDataPos && (mDataPos+pad_size(len)) <= mDataSize
+            && len <= pad_size(len)) {
+        const void* data = mData+mDataPos;
+        mDataPos += pad_size(len);
+        ALOGV("readInplace Setting data pos of %p to %zu", this, mDataPos);
+        return data;
+    }
+    return NULL;
+}
+
+template<class T>
+status_t parcel::readAligned(T *pArg) const {
+    COMPILE_TIME_ASSERT_FUNCTION_SCOPE(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
+
+    if ((mDataPos+sizeof(T)) <= mDataSize) {
+        const void* data = mData+mDataPos;
+        mDataPos += sizeof(T);
+        *pArg =  *reinterpret_cast<const T*>(data);
+        return NO_ERROR;
+    } else {
+        return NOT_ENOUGH_DATA;
+    }
+}
+
+template<class T>
+T parcel::readAligned() const {
+    T result;
+    if (readAligned(&result) != NO_ERROR) {
+        result = 0;
+    }
+
+    return result;
+}
+
+template<class T>
+status_t parcel::writeAligned(T val) {
+    COMPILE_TIME_ASSERT_FUNCTION_SCOPE(PAD_SIZE_UNSAFE(sizeof(T)) == sizeof(T));
+
+    if ((mDataPos+sizeof(val)) <= mDataCapacity) {
+restart_write:
+        *reinterpret_cast<T*>(mData+mDataPos) = val;
+        return finishWrite(sizeof(val));
+    }
+
+    status_t err = growData(sizeof(val));
+    if (err == NO_ERROR) goto restart_write;
+    return err;
+}
+
+status_t parcel::readInt32(int32_t *pArg) const
+{
+    return readAligned(pArg);
+}
+
+int32_t parcel::readInt32() const
+{
+    return readAligned<int32_t>();
+}
+
+
+status_t parcel::readInt64(int64_t *pArg) const
+{
+    return readAligned(pArg);
+}
+
+
+int64_t parcel::readInt64() const
+{
+    return readAligned<int64_t>();
+}
+
+status_t parcel::readPointer(uintptr_t *pArg) const
+{
+    status_t ret;
+    binder_uintptr_t ptr;
+    ret = readAligned(&ptr);
+    if (!ret)
+        *pArg = ptr;
+    return ret;
+}
+
+uintptr_t parcel::readPointer() const
+{
+    return readAligned<binder_uintptr_t>();
+}
+
+
+status_t parcel::readFloat(float *pArg) const
+{
+    return readAligned(pArg);
+}
+
+
+float parcel::readFloat() const
+{
+    return readAligned<float>();
+}
+
+#if defined(__mips__) && defined(__mips_hard_float)
+
+status_t parcel::readDouble(double *pArg) const
+{
+    union {
+      double d;
+      unsigned long long ll;
+    } u;
+    u.d = 0;
+    status_t status;
+    status = readAligned(&u.ll);
+    *pArg = u.d;
+    return status;
+}
+
+double parcel::readDouble() const
+{
+    union {
+      double d;
+      unsigned long long ll;
+    } u;
+    u.ll = readAligned<unsigned long long>();
+    return u.d;
+}
+
+#else
+
+status_t parcel::readDouble(double *pArg) const
+{
+    return readAligned(pArg);
+}
+
+double parcel::readDouble() const
+{
+    return readAligned<double>();
+}
+
+#endif
+
+status_t parcel::readIntPtr(intptr_t *pArg) const
+{
+    return readAligned(pArg);
+}
+
+
+intptr_t parcel::readIntPtr() const
+{
+    return readAligned<intptr_t>();
+}
+
+
+const char* parcel::readCString() const
+{
+    const size_t avail = mDataSize-mDataPos;
+    if (avail > 0) {
+        const char* str = reinterpret_cast<const char*>(mData+mDataPos);
+        // is the string's trailing NUL within the parcel's valid bounds?
+        const char* eos = reinterpret_cast<const char*>(memchr(str, 0, avail));
+        if (eos) {
+            const size_t len = eos - str;
+            mDataPos += pad_size(len+1);
+            ALOGV("readCString Setting data pos of %p to %zu", this, mDataPos);
+            return str;
+        }
+    }
+    return NULL;
+}
+
+String8 parcel::readString8() const
+{
+    int32_t size = readInt32();
+    // watch for potential int overflow adding 1 for trailing NUL
+    if (size > 0 && size < INT32_MAX) {
+        const char* str = (const char*)readInplace(size+1);
+        if (str) return String8(str, size);
+    }
+    return String8();
+}
+
+String16 parcel::readString16() const
+{
+    size_t len;
+    const uint16_t* str = readString16Inplace(&len);
+    if (str) return String16((const char16_t*)str, len);
+    ALOGE("Reading a NULL string not supported here.");
+    return String16();
+}
+
+const uint16_t* parcel::readString16Inplace(size_t* outLen) const
+{
+    int32_t size = readInt32();
+    // watch for potential int overflow from size+1
+    if (size >= 0 && size < INT32_MAX) {
+        *outLen = size;
+        const uint16_t* str = (const uint16_t*)readInplace((size+1)*sizeof(uint16_t));
+        if (str != NULL) {
+            return str;
+        }
+    }
+    *outLen = 0;
+    return NULL;
+}
+
+int32_t parcel::readExceptionCode() const
+{
+  int32_t exception_code = readAligned<int32_t>();
+  if (exception_code == binder::Status::EX_HAS_REPLY_HEADER) {
+    int32_t header_start = dataPosition();
+    int32_t header_size = readAligned<int32_t>();
+    // Skip over fat responses headers.  Not used (or propagated) in
+    // native code
+    setDataPosition(header_start + header_size);
+    // And fat response headers are currently only used when there are no
+    // exceptions, so return no error:
+    return 0;
+  }
+  return exception_code;
+}
+
+native_handle* parcel::readNativeHandle() const
+{
+    int numFds, numInts;
+    status_t err;
+    err = readInt32(&numFds);
+    if (err != NO_ERROR) return 0;
+    err = readInt32(&numInts);
+    if (err != NO_ERROR) return 0;
+
+    native_handle* h = native_handle_create(numFds, numInts);
+    if (!h) {
+        return 0;
+    }
+
+    for (int i=0 ; err==NO_ERROR && i<numFds ; i++) {
+        h->data[i] = dup(readFileDescriptor());
+        if (h->data[i] < 0) err = BAD_VALUE;
+    }
+    err = read(h->data + numFds, sizeof(int)*numInts);
+    if (err != NO_ERROR) {
+        native_handle_close(h);
+        native_handle_delete(h);
+        h = 0;
+    }
+    return h;
+}
+
+
+int parcel::readFileDescriptor() const
+{
+    const flat_binder_object* flat = readObject(true);
+    if (flat) {
+        switch (flat->type) {
+            case BINDER_TYPE_FD:
+                //ALOGI("Returning file descriptor %ld from parcel %p", flat->handle, this);
+                return flat->handle;
+        }
+    }
+    return BAD_TYPE;
+}
+
+// WARNING: This method must stay in sync with writeToParcel()
+// in frameworks/base/core/java/android/os/ParcelFileDescriptor.java
+int parcel::readParcelFileDescriptor(int& outCommChannel) const {
+    int fd;
+    outCommChannel = -1;
+
+    if (readInt32() == 0) {
+        fd = -1;
+    } else {
+        fd = readFileDescriptor();
+        if (fd >= 0 && readInt32() != 0) {
+            outCommChannel = readFileDescriptor();
+        }
+    }
+    return fd;
+}
+
+status_t parcel::readBlob(size_t len, ReadableBlob* outBlob) const
+{
+    int32_t useAshmem;
+    status_t status = readInt32(&useAshmem);
+    if (status) return status;
+
+    if (!useAshmem) {
+        ALOGV("readBlob: read in place");
+        const void* ptr = readInplace(len);
+        if (!ptr) return BAD_VALUE;
+
+        outBlob->init(false /*mapped*/, const_cast<void*>(ptr), len);
+        return NO_ERROR;
+    }
+
+    ALOGV("readBlob: read from ashmem");
+    int fd = readFileDescriptor();
+    if (fd == int(BAD_TYPE)) return BAD_VALUE;
+
+    void* ptr = ::mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) return NO_MEMORY;
+
+    outBlob->init(true /*mapped*/, ptr, len);
+    return NO_ERROR;
+}
+
+status_t parcel::read(FlattenableHelperInterface& val) const
+{
+    // size
+    const size_t len = this->readInt32();
+    const size_t fd_count = this->readInt32();
+
+    // payload
+    void const* const buf = this->readInplace(pad_size(len));
+    if (buf == NULL)
+        return BAD_VALUE;
+
+    int* fds = NULL;
+    if (fd_count) {
+        fds = new int[fd_count];
+    }
+
+    status_t err = NO_ERROR;
+    for (size_t i=0 ; i<fd_count && err==NO_ERROR ; i++) {
+        fds[i] = dup(this->readFileDescriptor());
+        if (fds[i] < 0) {
+            err = BAD_VALUE;
+            ALOGE("dup() failed in Parcel::read, i is %zu, fds[i] is %d, fd_count is %zu, error: %s",
+                i, fds[i], fd_count, strerror(errno));
+        }
+    }
+
+    if (err == NO_ERROR) {
+        err = val.unflatten(buf, len, fds, fd_count);
+    }
+
+    if (fd_count) {
+        delete [] fds;
+    }
+
+    return err;
+}
+const flat_binder_object* parcel::readObject(bool nullMetaData) const
+{
+    const size_t DPOS = mDataPos;
+    if ((DPOS+sizeof(flat_binder_object)) <= mDataSize) {
+        const flat_binder_object* obj
+                = reinterpret_cast<const flat_binder_object*>(mData+DPOS);
+        mDataPos = DPOS + sizeof(flat_binder_object);
+        if (!nullMetaData && (obj->cookie == 0 && obj->binder == 0)) {
+            // When transferring a NULL object, we don't write it into
+            // the object list, so we don't want to check for it when
+            // reading.
+            ALOGV("readObject Setting data pos of %p to %zu", this, mDataPos);
+            return obj;
+        }
+
+        // Ensure that this object is valid...
+        binder_size_t* const OBJS = mObjects;
+        const size_t N = mObjectsSize;
+        size_t opos = mNextObjectHint;
+
+        if (N > 0) {
+            ALOGV("Parcel %p looking for obj at %zu, hint=%zu",
+                 this, DPOS, opos);
+
+            // Start at the current hint position, looking for an object at
+            // the current data position.
+            if (opos < N) {
+                while (opos < (N-1) && OBJS[opos] < DPOS) {
+                    opos++;
+                }
+            } else {
+                opos = N-1;
+            }
+            if (OBJS[opos] == DPOS) {
+                // Found it!
+                ALOGV("Parcel %p found obj %zu at index %zu with forward search",
+                     this, DPOS, opos);
+                mNextObjectHint = opos+1;
+                ALOGV("readObject Setting data pos of %p to %zu", this, mDataPos);
+                return obj;
+            }
+
+            // Look backwards for it...
+            while (opos > 0 && OBJS[opos] > DPOS) {
+                opos--;
+            }
+            if (OBJS[opos] == DPOS) {
+                // Found it!
+                ALOGV("Parcel %p found obj %zu at index %zu with backward search",
+                     this, DPOS, opos);
+                mNextObjectHint = opos+1;
+                ALOGV("readObject Setting data pos of %p to %zu", this, mDataPos);
+                return obj;
+            }
+        }
+        ALOGW("Attempt to read object from Parcel %p at offset %zu that is not in the object list",
+             this, DPOS);
+    }
+    return NULL;
+}
+
+void parcel::closeFileDescriptors()
+{
+    size_t i = mObjectsSize;
+    if (i > 0) {
+        //ALOGI("Closing file descriptors for %zu objects...", i);
+    }
+    while (i > 0) {
+        i--;
+        const flat_binder_object* flat
+            = reinterpret_cast<flat_binder_object*>(mData+mObjects[i]);
+        if (flat->type == BINDER_TYPE_FD) {
+            //ALOGI("Closing fd: %ld", flat->handle);
+            close(flat->handle);
+        }
+    }
+}
+
+uintptr_t parcel::ipcData() const
+{
+    return reinterpret_cast<uintptr_t>(mData);
+}
+
+size_t parcel::ipcDataSize() const
+{
+    return (mDataSize > mDataPos ? mDataSize : mDataPos);
+}
+
+uintptr_t parcel::ipcObjects() const
+{
+    return reinterpret_cast<uintptr_t>(mObjects);
+}
+
+size_t parcel::ipcObjectsCount() const
+{
+    return mObjectsSize;
+}
+
+void parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
+    const binder_size_t* objects, size_t objectsCount, release_func relFunc, void* relCookie)
+{
+    binder_size_t minOffset = 0;
+    freeDataNoInit();
+    mError = NO_ERROR;
+    mData = const_cast<uint8_t*>(data);
+    mDataSize = mDataCapacity = dataSize;
+    //ALOGI("setDataReference Setting data size of %p to %lu (pid=%d)", this, mDataSize, getpid());
+    mDataPos = 0;
+    ALOGV("setDataReference Setting data pos of %p to %zu", this, mDataPos);
+    mObjects = const_cast<binder_size_t*>(objects);
+    mObjectsSize = mObjectsCapacity = objectsCount;
+    mNextObjectHint = 0;
+    mOwner = relFunc;
+    mOwnerCookie = relCookie;
+    for (size_t i = 0; i < mObjectsSize; i++) {
+        binder_size_t offset = mObjects[i];
+        if (offset < minOffset) {
+            ALOGE("%s: bad object offset %" PRIu64 " < %" PRIu64 "\n",
+                  __func__, (uint64_t)offset, (uint64_t)minOffset);
+            mObjectsSize = 0;
+            break;
+        }
+        minOffset = offset + sizeof(flat_binder_object);
+    }
+    scanForFds();
+}
+
+void parcel::print(TextOutput& to, uint32_t /*flags*/) const
+{
+    to << "Parcel(";
+
+    if (errorCheck() != NO_ERROR) {
+        const status_t err = errorCheck();
+        to << "Error: " << (void*)(intptr_t)err << " \"" << strerror(-err) << "\"";
+    } else if (dataSize() > 0) {
+        const uint8_t* DATA = data();
+        to << indent << HexDump(DATA, dataSize()) << dedent;
+        const binder_size_t* OBJS = objects();
+        const size_t N = objectsCount();
+        for (size_t i=0; i<N; i++) {
+            const flat_binder_object* flat
+                = reinterpret_cast<const flat_binder_object*>(DATA+OBJS[i]);
+            to << endl << "Object #" << i << " @ " << (void*)OBJS[i] << ": "
+                << TypeCode(flat->type & 0x7f7f7f00)
+                << " = " << flat->binder;
+        }
+    } else {
+        to << "NULL";
+    }
+
+    to << ")";
+}
+
+void parcel::releaseObjects()
+{
+    const sp<ProcessState> proc(ProcessState::self());
+    size_t i = mObjectsSize;
+    uint8_t* const data = mData;
+    binder_size_t* const objects = mObjects;
+    while (i > 0) {
+        i--;
+        const flat_binder_object* flat
+            = reinterpret_cast<flat_binder_object*>(data+objects[i]);
+        release_object(proc, *flat, this);
+    }
+}
+
+void parcel::acquireObjects()
+{
+    const sp<ProcessState> proc(ProcessState::self());
+    size_t i = mObjectsSize;
+    uint8_t* const data = mData;
+    binder_size_t* const objects = mObjects;
+    while (i > 0) {
+        i--;
+        const flat_binder_object* flat
+            = reinterpret_cast<flat_binder_object*>(data+objects[i]);
+        acquire_object(proc, *flat, this);
+    }
+}
+
+void parcel::freeData()
+{
+    freeDataNoInit();
+    initState();
+}
+
+void parcel::freeDataNoInit()
+{
+    if (mOwner) {
+        LOG_ALLOC("Parcel %p: freeing other owner data", this);
+        //ALOGI("Freeing data ref of %p (pid=%d)", this, getpid());
+        mOwner(this, mData, mDataSize, mObjects, mObjectsSize, mOwnerCookie);
+    } else {
+        LOG_ALLOC("Parcel %p: freeing allocated data", this);
+        releaseObjects();
+        if (mData) {
+            LOG_ALLOC("Parcel %p: freeing with %zu capacity", this, mDataCapacity);
+            pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+            gParcelGlobalAllocSize -= mDataCapacity;
+            gParcelGlobalAllocCount--;
+            pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+            free(mData);
+        }
+        if (mObjects) free(mObjects);
+    }
+}
+
+status_t parcel::growData(size_t len)
+{
+    size_t newSize = ((mDataSize+len)*3)/2;
+    return (newSize <= mDataSize)
+            ? (status_t) NO_MEMORY
+            : continueWrite(newSize);
+}
+
+status_t parcel::restartWrite(size_t desired)
+{
+    if (mOwner) {
+        freeData();
+        return continueWrite(desired);
+    }
+
+    uint8_t* data = (uint8_t*)realloc(mData, desired);
+    if (!data && desired > mDataCapacity) {
+        mError = NO_MEMORY;
+        return NO_MEMORY;
+    }
+
+    releaseObjects();
+
+    if (data) {
+        LOG_ALLOC("Parcel %p: restart from %zu to %zu capacity", this, mDataCapacity, desired);
+        pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+        gParcelGlobalAllocSize += desired;
+        gParcelGlobalAllocSize -= mDataCapacity;
+        pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+        mData = data;
+        mDataCapacity = desired;
+    }
+
+    mDataSize = mDataPos = 0;
+    ALOGV("restartWrite Setting data size of %p to %zu", this, mDataSize);
+    ALOGV("restartWrite Setting data pos of %p to %zu", this, mDataPos);
+
+    free(mObjects);
+    mObjects = NULL;
+    mObjectsSize = mObjectsCapacity = 0;
+    mNextObjectHint = 0;
+    mHasFds = false;
+    mFdsKnown = true;
+    mAllowFds = true;
+
+    return NO_ERROR;
+}
+
+status_t parcel::continueWrite(size_t desired)
+{
+    // If shrinking, first adjust for any objects that appear
+    // after the new data size.
+    size_t objectsSize = mObjectsSize;
+    if (desired < mDataSize) {
+        if (desired == 0) {
+            objectsSize = 0;
+        } else {
+            while (objectsSize > 0) {
+                if (mObjects[objectsSize-1] < desired)
+                    break;
+                objectsSize--;
+            }
+        }
+    }
+
+    if (mOwner) {
+        // If the size is going to zero, just release the owner's data.
+        if (desired == 0) {
+            freeData();
+            return NO_ERROR;
+        }
+
+        // If there is a different owner, we need to take
+        // posession.
+        uint8_t* data = (uint8_t*)malloc(desired);
+        if (!data) {
+            mError = NO_MEMORY;
+            return NO_MEMORY;
+        }
+        binder_size_t* objects = NULL;
+
+        if (objectsSize) {
+            objects = (binder_size_t*)malloc(objectsSize*sizeof(binder_size_t));
+            if (!objects) {
+                free(data);
+
+                mError = NO_MEMORY;
+                return NO_MEMORY;
+            }
+
+            // Little hack to only acquire references on objects
+            // we will be keeping.
+            size_t oldObjectsSize = mObjectsSize;
+            mObjectsSize = objectsSize;
+            acquireObjects();
+            mObjectsSize = oldObjectsSize;
+        }
+
+        if (mData) {
+            memcpy(data, mData, mDataSize < desired ? mDataSize : desired);
+        }
+        if (objects && mObjects) {
+            memcpy(objects, mObjects, objectsSize*sizeof(binder_size_t));
+        }
+        //ALOGI("Freeing data ref of %p (pid=%d)", this, getpid());
+        mOwner(this, mData, mDataSize, mObjects, mObjectsSize, mOwnerCookie);
+        mOwner = NULL;
+
+        LOG_ALLOC("Parcel %p: taking ownership of %zu capacity", this, desired);
+        pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+        gParcelGlobalAllocSize += desired;
+        gParcelGlobalAllocCount++;
+        pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+
+        mData = data;
+        mObjects = objects;
+        mDataSize = (mDataSize < desired) ? mDataSize : desired;
+        ALOGV("continueWrite Setting data size of %p to %zu", this, mDataSize);
+        mDataCapacity = desired;
+        mObjectsSize = mObjectsCapacity = objectsSize;
+        mNextObjectHint = 0;
+
+    } else if (mData) {
+        if (objectsSize < mObjectsSize) {
+            // Need to release refs on any objects we are dropping.
+            const sp<ProcessState> proc(ProcessState::self());
+            for (size_t i=objectsSize; i<mObjectsSize; i++) {
+                const flat_binder_object* flat
+                    = reinterpret_cast<flat_binder_object*>(mData+mObjects[i]);
+                if (flat->type == BINDER_TYPE_FD) {
+                    // will need to rescan because we may have lopped off the only FDs
+                    mFdsKnown = false;
+                }
+                release_object(proc, *flat, this);
+            }
+            binder_size_t* objects =
+                (binder_size_t*)realloc(mObjects, objectsSize*sizeof(binder_size_t));
+            if (objects) {
+                mObjects = objects;
+            }
+            mObjectsSize = objectsSize;
+            mNextObjectHint = 0;
+        }
+
+        // We own the data, so we can just do a realloc().
+        if (desired > mDataCapacity) {
+            uint8_t* data = (uint8_t*)realloc(mData, desired);
+            if (data) {
+                LOG_ALLOC("Parcel %p: continue from %zu to %zu capacity", this, mDataCapacity,
+                        desired);
+                pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+                gParcelGlobalAllocSize += desired;
+                gParcelGlobalAllocSize -= mDataCapacity;
+                pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+                mData = data;
+                mDataCapacity = desired;
+            } else if (desired > mDataCapacity) {
+                mError = NO_MEMORY;
+                return NO_MEMORY;
+            }
+        } else {
+            if (mDataSize > desired) {
+                mDataSize = desired;
+                ALOGV("continueWrite Setting data size of %p to %zu", this, mDataSize);
+            }
+            if (mDataPos > desired) {
+                mDataPos = desired;
+                ALOGV("continueWrite Setting data pos of %p to %zu", this, mDataPos);
+            }
+        }
+
+    } else {
+        // This is the first data.  Easy!
+        uint8_t* data = (uint8_t*)malloc(desired);
+        if (!data) {
+            mError = NO_MEMORY;
+            return NO_MEMORY;
+        }
+
+        if(!(mDataCapacity == 0 && mObjects == NULL
+             && mObjectsCapacity == 0)) {
+            ALOGE("continueWrite: %zu/%p/%zu/%zu", mDataCapacity, mObjects, mObjectsCapacity, desired);
+        }
+
+        LOG_ALLOC("Parcel %p: allocating with %zu capacity", this, desired);
+        pthread_mutex_lock(&gParcelGlobalAllocSizeLock);
+        gParcelGlobalAllocSize += desired;
+        gParcelGlobalAllocCount++;
+        pthread_mutex_unlock(&gParcelGlobalAllocSizeLock);
+
+        mData = data;
+        mDataSize = mDataPos = 0;
+        ALOGV("continueWrite Setting data size of %p to %zu", this, mDataSize);
+        ALOGV("continueWrite Setting data pos of %p to %zu", this, mDataPos);
+        mDataCapacity = desired;
+    }
+
+    return NO_ERROR;
+}
+
+void parcel::initState()
+{
+    LOG_ALLOC("Parcel %p: initState", this);
+    mError = NO_ERROR;
+    mData = 0;
+    mDataSize = 0;
+    mDataCapacity = 0;
+    mDataPos = 0;
+    ALOGV("initState Setting data size of %p to %zu", this, mDataSize);
+    ALOGV("initState Setting data pos of %p to %zu", this, mDataPos);
+    mObjects = NULL;
+    mObjectsSize = 0;
+    mObjectsCapacity = 0;
+    mNextObjectHint = 0;
+    mHasFds = false;
+    mFdsKnown = true;
+    mAllowFds = true;
+    mOwner = NULL;
+}
+
+void parcel::scanForFds() const
+{
+    bool hasFds = false;
+    for (size_t i=0; i<mObjectsSize; i++) {
+        const flat_binder_object* flat
+            = reinterpret_cast<const flat_binder_object*>(mData + mObjects[i]);
+        if (flat->type == BINDER_TYPE_FD) {
+            hasFds = true;
+            break;
+        }
+    }
+    mHasFds = hasFds;
+    mFdsKnown = true;
+}
+
+// --- parcel::Blob ---
+
+parcel::Blob::Blob() :
+        mMapped(false), mData(NULL), mSize(0) {
+}
+
+parcel::Blob::~Blob() {
+    release();
+}
+
+void parcel::Blob::release() {
+    if (mMapped && mData) {
+        ::munmap(mData, mSize);
+    }
+    clear();
+}
+
+void parcel::Blob::init(bool mapped, void* data, size_t size) {
+    mMapped = mapped;
+    mData = data;
+    mSize = size;
+}
+
+void parcel::Blob::clear() {
+    mMapped = false;
+    mData = NULL;
+    mSize = 0;
+}
+
+#endif // LEGACY_BLOB_COMPATIBLE
+
 }; // namespace android
