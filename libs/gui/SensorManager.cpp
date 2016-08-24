@@ -237,5 +237,129 @@ bool SensorManager::isDataInjectionEnabled() {
     return false;
 }
 
+#ifdef LEGACY_BLOB_COMPATIBLE
+
+#define PACKAGE_NAME "com.android.camera2"
+
+ANDROID_SINGLETON_STATIC_INSTANCE(sensormanager)
+
+sensormanager::sensormanager()
+    : mSensorList(0)
+{
+}
+
+sensormanager::~sensormanager()
+{
+    free(mSensorList);
+}
+
+void sensormanager::sensorManagerDied()
+{
+    Mutex::Autolock _l(mLock);
+    mSensorServer.clear();
+    free(mSensorList);
+    mSensorList = NULL;
+    mSensors.clear();
+}
+
+status_t sensormanager::assertStateLocked() const {
+    if (mSensorServer == NULL) {
+        // try for one second
+        const sp<IServiceManager> sm = defaultServiceManager();
+        const String16 name("sensorservice");
+        for (int i=0 ; i<4 ; i++) {
+            mSensorServer = interface_cast<ISensorServer>(sm->checkService(name));
+            if (mSensorServer != NULL) {
+                break;
+            }
+            usleep(250000);
+        }
+        if (mSensorServer == NULL) {
+            return NAME_NOT_FOUND;
+        }
+
+        class DeathObserver : public IBinder::DeathRecipient {
+            sensormanager& mSensorManger;
+            virtual void binderDied(const wp<IBinder>& who) {
+                ALOGW("sensorservice died [%p]", who.unsafe_get());
+                mSensorManger.sensorManagerDied();
+            }
+        public:
+            DeathObserver(sensormanager& mgr) : mSensorManger(mgr) { }
+        };
+
+        mDeathObserver = new DeathObserver(*const_cast<sensormanager *>(this));
+        IInterface::asBinder(mSensorServer)->linkToDeath(mDeathObserver);
+
+        mSensors = mSensorServer->getSensorList(String16(PACKAGE_NAME));
+        size_t count = mSensors.size();
+        mSensorList =
+                static_cast<Sensor const**>(malloc(count * sizeof(Sensor*)));
+        for (size_t i=0 ; i<count ; i++) {
+            mSensorList[i] = mSensors.array() + i;
+        }
+    }
+
+    return NO_ERROR;
+}
+
+ssize_t sensormanager::getSensorList(Sensor const* const** list) const
+{
+    Mutex::Autolock _l(mLock);
+    status_t err = assertStateLocked();
+    if (err < 0) {
+        return static_cast<ssize_t>(err);
+    }
+    *list = mSensorList;
+    return static_cast<ssize_t>(mSensors.size());
+}
+
+Sensor const* sensormanager::getDefaultSensor(int type)
+{
+    Mutex::Autolock _l(mLock);
+    if (assertStateLocked() == NO_ERROR) {
+        bool wakeUpSensor = false;
+        // For the following sensor types, return a wake-up sensor. These types are by default
+        // defined as wake-up sensors. For the rest of the sensor types defined in sensors.h return
+        // a non_wake-up version.
+        if (type == SENSOR_TYPE_PROXIMITY || type == SENSOR_TYPE_SIGNIFICANT_MOTION ||
+            type == SENSOR_TYPE_TILT_DETECTOR || type == SENSOR_TYPE_WAKE_GESTURE ||
+            type == SENSOR_TYPE_GLANCE_GESTURE || type == SENSOR_TYPE_PICK_UP_GESTURE) {
+            wakeUpSensor = true;
+        }
+        // For now we just return the first sensor of that type we find.
+        // in the future it will make sense to let the SensorService make
+        // that decision.
+        for (size_t i=0 ; i<mSensors.size() ; i++) {
+            if (mSensorList[i]->getType() == type &&
+                mSensorList[i]->isWakeUpSensor() == wakeUpSensor) {
+                return mSensorList[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+sp<SensorEventQueue> sensormanager::createEventQueue()
+{
+    sp<SensorEventQueue> queue;
+
+    Mutex::Autolock _l(mLock);
+    while (assertStateLocked() == NO_ERROR) {
+        sp<ISensorEventConnection> connection =
+                mSensorServer->createSensorEventConnection(String8(""), 0, String16(PACKAGE_NAME));
+        if (connection == NULL) {
+            // SensorService just died.
+            ALOGE("createEventQueue: connection is NULL. SensorService died.");
+            continue;
+        }
+        queue = new SensorEventQueue(connection);
+        break;
+    }
+    return queue;
+}
+
+#endif // LEGACY_BLOB_COMPATIBLE
+
 // ----------------------------------------------------------------------------
 }; // namespace android
